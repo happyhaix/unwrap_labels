@@ -1,0 +1,1859 @@
+import cv2
+import os
+import numpy as np
+import time
+
+from exceptiongroup import catch
+
+BLACK_COLOR = (0, 0, 0)
+WHITE_COLOR = (255, 255, 255)
+YELLOW_COLOR = (0, 255, 255)
+GREEN_COLOR = (0, 255, 0)
+RED_COLOR = (0, 0, 255)
+
+
+class Line(object):
+    def __init__(self, point1, point2):
+        """
+        For line formula y(x) = k * x + b, calc k and b params
+        If the line is vertical, set "vertical" attr to True and save "x" position of the line
+        """
+        self.point1 = point1
+        self.point2 = point2
+        self.vertical = False
+        self.fixed_x = None
+        self.k = None
+        self.b = None
+
+        # cached angle props
+        self.angle = None
+        self.angle_cos = None
+        self.angle_sin = None
+
+        self.set_line_props(point1, point2)
+        print("y = ", self.k, "x+", self.b)
+
+    def is_vertical(self):
+        return self.vertical
+
+    def set_line_props(self, point1, point2):
+        if point2[0] - point1[0]:
+            self.k = float(point2[1] - point1[1]) / (point2[0] - point1[0])
+            self.b = point2[1] - self.k * point2[0]
+
+            k_normal = - 1 / self.k
+        else:
+            self.vertical = True
+            self.fixed_x = point2[0]
+
+            k_normal = 0
+
+        self.angle = np.arctan(k_normal)
+        self.angle_cos = np.cos(self.angle)
+        self.angle_sin = np.sin(self.angle)
+
+
+    def get_x(self, y):
+        if self.is_vertical():
+            return self.fixed_x
+        else:
+            return int(round(float(y - self.b) / self.k))
+
+    def get_y(self, x):
+        return self.k * x + self.b
+
+
+class LabelUnwrapper(object):
+    COL_COUNT = 30
+    ROW_COUNT = 20
+
+    def __init__(self, src_image=None, pixel_points=None, percent_points=None):
+        """
+        Point lists are lists of 6 points - [A, B, C, D, E, F]
+
+        :param pixel_points: List[Tuple] Points, whose coordinates specified as pixels
+        :param percent_points: List[Tuple] Points, whose coordinates specified as fraction of image width/height
+
+        In both cases points represent figure below:
+
+        |           |                  |        |
+        |    - B -  |                  A        C
+        | /       \ |                  | \    / |
+        A           C                  |   B    |
+        |           |                  |        |
+        |           |       OR         |        |
+        |           |                  |        |
+        F           D                  F        D
+        | \       / |                  | \    / |
+        |   - E -   |                  |   E    |
+        |           |                  |        |
+
+        So, A-B-C-D-E-F-A polygon represent raw wine label on bottle
+
+        """
+        self.src_image = src_image
+        self.width = self.src_image.shape[1]
+        self.height = src_image.shape[0]
+
+        self.dst_image = None
+        self.points = pixel_points
+        self.percent_points = percent_points
+
+        self.point_a = None  # top left
+        self.point_b = None  # top center
+        self.point_c = None  # top right
+        self.point_d = None  # bottom right
+        self.point_e = None  # bottom center
+        self.point_f = None  # bottom left
+
+        self.center_line = None
+        self.load_points()
+
+    def load_points(self):
+        if self.points is None:
+            points = []
+            for point in self.percent_points:
+                x = int(point[0] * self.width)
+                y = int(point[1] * self.height)
+                points.append((x, y))
+
+            self.points = points
+
+        self.points = np.array(self.points)
+        (self.point_a, self.point_b, self.point_c,
+         self.point_d, self.point_e, self.point_f) = self.points
+
+        center_top = (self.point_a + self.point_c) / 2
+        center_bottom = (self.point_d + self.point_f) / 2
+
+        self.center_line = Line(center_bottom, center_top)
+        if not len(self.points) == 6:
+            raise ValueError("Points should be an array of 6 elements")
+
+    def unwrap(self, interpolate=False):
+        source_map = self.calc_source_map()
+        if interpolate:
+            self.unwrap_label_interpolation(source_map)
+        else:
+            self.unwrap_label_perspective(source_map)
+        return self.dst_image
+
+    def calc_dest_map(self):
+        width, height = self.get_label_size()
+
+        dx = float(width) / (self.COL_COUNT - 1)
+        dy = float(height) / (self.ROW_COUNT - 1)
+
+        rows = []
+        for row_index in range(self.ROW_COUNT):
+            row = []
+            for col_index in range(self.COL_COUNT):
+                row.append([int(dx * col_index),
+                            int(dy * row_index)])
+
+            rows.append(row)
+        return np.array(rows)
+
+    def unwrap_label_interpolation(self, source_map):
+        """
+        Unwrap label using interpolation - more accurate method in terms of quality
+        """
+        print("Unwrap label using interpolation - more accurate method in terms of quality")
+        from scipy.interpolate import griddata
+
+        width, height = self.get_label_size()
+
+        dest_map = self.calc_dest_map()
+
+        grid_x, grid_y = np.mgrid[0:width - 1:width * 1j, 0:height - 1:height * 1j]
+
+        destination = dest_map.reshape(dest_map.size // 2, 2)
+        source = source_map.reshape(source_map.size // 2, 2)
+
+        grid_z = griddata(destination, source, (grid_x, grid_y), method='cubic')
+        map_x = np.append([], [ar[:, 0] for ar in grid_z]).reshape(width, height)
+        map_y = np.append([], [ar[:, 1] for ar in grid_z]).reshape(width, height)
+        map_x_32 = map_x.astype('float32')
+        map_y_32 = map_y.astype('float32')
+        warped = cv2.remap(self.src_image, map_x_32, map_y_32, cv2.INTER_CUBIC)
+        self.dst_image = cv2.transpose(warped)
+
+    def unwrap_label_perspective(self, source_map):
+        """
+        Unwrap label using transform, unlike unwrap_label_interpolation doesn't require scipy
+        """
+        print("Unwrapping label using perspective transform")
+        width, height = self.get_label_size()
+        self.dst_image = np.zeros((height, width, 3), np.uint8)
+
+        dx = float(width) / (self.COL_COUNT - 1)
+        dy = float(height) / (self.ROW_COUNT - 1)
+
+        dx_int = int(np.ceil(dx))
+        dy_int = int(np.ceil(dy))
+
+        for row_index in range(self.ROW_COUNT - 1):
+            for col_index in range(self.COL_COUNT - 1):
+                src_cell = (source_map[row_index][col_index],
+                            source_map[row_index][col_index + 1],
+                            source_map[row_index + 1][col_index],
+                            source_map[row_index + 1][col_index + 1])
+
+                dst_cell = np.int32([[0, 0], [dx, 0], [0, dy], [dx, dy]])
+
+                M = cv2.getPerspectiveTransform(np.float32(src_cell), np.float32(dst_cell))
+                dst = cv2.warpPerspective(self.src_image, M, (dx_int, dy_int))
+                x_offset = int(dx * col_index)
+                y_offset = int(dy * row_index)
+
+                self.dst_image[y_offset:y_offset + dy_int,
+                               x_offset:x_offset + dx_int] = dst
+
+    def get_roi_rect(self, points):
+        max_x = min_x = points[0][0]
+        max_y = min_y = points[0][1]
+        for point in points:
+            x, y = point
+            if x > max_x:
+                max_x = x
+            if x < min_x:
+                min_x = x
+            if y > max_y:
+                max_y = y
+            if y < min_y:
+                min_y = y
+
+        return np.array([
+            [min_x, min_y],
+            [max_x, min_y],
+            [max_x, max_y],
+            [min_x, max_y]
+        ])
+
+    def get_roi(self, image, points):
+        rect = self.get_roi_rect(points)
+        return image[np.floor(rect[0][1]):np.ceil(rect[2][1]),
+                     np.floor(rect[0][0]):np.ceil(rect[1][0])]
+
+    def calc_source_map(self):
+        top_points = self.calc_ellipse_points(self.point_a, self.point_b, self.point_c,
+                                              self.COL_COUNT)
+        bottom_points = self.calc_ellipse_points(self.point_f, self.point_e, self.point_d,
+                                                 self.COL_COUNT)
+
+        rows = []
+        for row_index in range(self.ROW_COUNT):
+            row = []
+            for col_index in range(self.COL_COUNT):
+                top_point = top_points[col_index]
+                bottom_point = bottom_points[col_index]
+
+                delta = (top_point - bottom_point) / float(self.ROW_COUNT - 1)
+
+                point = top_point - delta * row_index
+                row.append(point)
+            rows.append(row)
+        return np.array(rows)
+
+    def draw_mesh(self, color=RED_COLOR, thickness=1):
+        mesh = self.calc_source_map()
+        for row in mesh:
+            for x, y in row:
+                point = (int(round(x)), int(round(y)))
+                cv2.line(self.src_image, point, point, color=color, thickness=thickness)
+
+    def draw_poly_mask(self, color=WHITE_COLOR):
+        cv2.polylines(self.src_image, np.int32([self.points]), 1, color)
+
+    def draw_mask(self, color=WHITE_COLOR, thickness=3, img=None):
+        """
+        Draw mask, if image not specified - draw to source image
+        """
+        if img is None:
+            img = self.src_image
+        lineWidth =2
+        linecolor =   (255, 0, 0)
+        cv2.line(img, tuple(self.point_f.tolist()), tuple(self.point_a.tolist()), linecolor, lineWidth)
+        cv2.line(img, tuple(self.point_c.tolist()), tuple(self.point_d.tolist()), linecolor, lineWidth)
+
+        self.draw_ellipse(img, self.point_a, self.point_b, self.point_c, linecolor, lineWidth)
+        self.draw_ellipse(img, self.point_d, self.point_e, self.point_f, linecolor, lineWidth)
+
+    def get_label_contour(self, color=WHITE_COLOR, thickness=3):
+        mask = np.zeros(self.src_image.shape)
+        self.draw_mask(color, thickness, mask)
+        return mask
+
+    def get_label_mask(self):
+        """
+        Generate mask of the label, fully covering it
+        """
+        mask = np.zeros(self.src_image.shape)
+        pts = np.array([[self.point_a, self.point_c, self.point_d, self.point_f]])
+        cv2.fillPoly(mask, pts, WHITE_COLOR)
+        self.draw_filled_ellipse(mask, self.point_a, self.point_b, self.point_c, True)
+        self.draw_filled_ellipse(mask, self.point_f, self.point_e, self.point_d, False)
+        return mask
+
+    def draw_ellipse(self, img, left, top, right, color=WHITE_COLOR, thickness=1):
+        """
+        Draw ellipse using opencv function
+        """
+        is_arc, center_point, axis, angle = self.get_ellipse_params(left, top, right)
+
+        if is_arc:
+            start_angle, end_angle = 0, 180
+        else:
+            start_angle, end_angle = 180, 360
+
+        start_angle, end_angle = 0, 360
+        cv2.ellipse(img, center_point, axis, angle, start_angle, end_angle, color, thickness)
+
+    def draw_filled_ellipse(self, img, left, top, right, is_top=False):
+        is_arc, center_point, axis, angle = self.get_ellipse_params(left, top, right)
+
+        if is_arc ^ is_top:
+            color = WHITE_COLOR
+        else:
+            color = BLACK_COLOR
+
+        cv2.ellipse(img, center_point, axis, angle, 0, 360, color=color, thickness=-1)
+
+    def get_ellipse_params(self, left, top, right):
+        center = (left + right) / 2
+        center_point = tuple(map(lambda x: int(np.round(x)), center.tolist()))
+
+        axis = (int(np.linalg.norm(left - right) / 2), int(np.linalg.norm(center - top)))
+
+        x, y = left - right
+        angle = np.arctan(float(y) / x) * 57.296
+
+        is_arc = False
+        if (top - center)[1] > 0:
+            is_arc = True
+
+        return is_arc, center_point, axis, angle
+
+    def calc_ellipse_points(self, left, top, right, points_count):
+        center = (left + right) / 2
+
+        # get ellipse axis
+        a = np.linalg.norm(left - right) / 2
+        b = np.linalg.norm(center - top)
+
+        # get start and end angles
+        if (top - center)[1] > 0:
+            delta = np.pi / (points_count - 1)
+
+        else:
+            delta = - np.pi / (points_count - 1)
+
+        cos_rot = (right - center)[0] / a
+        sin_rot = (right - center)[1] / a
+
+        points = []
+        for i in range(points_count):
+            phi = i * delta
+            dx, dy = self.get_ellipse_point(a, b, phi)
+
+            x = round(center[0] + dx * cos_rot - dy * sin_rot)
+            y = round(center[1] + dx * sin_rot + dy * cos_rot)
+
+            points.append([x, y])
+
+        points.reverse()
+        return np.array(points)
+
+    def get_ellipse_point(self, a, b, phi):
+        """
+        Get ellipse radius in polar coordinates
+        """
+        return a * np.cos(phi), b * np.sin(phi)
+
+    def get_label_size(self):
+        top_left = self.point_a
+        top_right = self.point_c
+        bottom_right = self.point_d
+        bottom_left = self.point_f
+
+        width1 = np.linalg.norm(top_left - top_right)
+        width2 = np.linalg.norm(bottom_left - bottom_right)
+        avg_width = int((width1 + width2) * np.pi / 4)
+
+        height1 = np.linalg.norm(top_left - bottom_left)
+        height2 = np.linalg.norm(top_right - bottom_right)
+        avg_height = int((height1 + height2) / 2)
+        return avg_width, avg_height
+
+
+
+def get_equidistant_line(line1_point1, line1_point2, line2_point1, line2_point2):
+    """
+    计算到两条直线距离相等的直线，并返回该直线上y坐标为200和800的两个点
+
+    参数:
+    line1_point1, line1_point2: 第一条直线上的两个点
+    line2_point1, line2_point2: 第二条直线上的两个点
+
+    返回:
+    tuple: (y=200的点坐标, y=800的点坐标)
+    """
+    # 将输入点转换为numpy数组
+    p1 = np.array(line1_point1, dtype=np.float32)
+    p2 = np.array(line1_point2, dtype=np.float32)
+    p3 = np.array(line2_point1, dtype=np.float32)
+    p4 = np.array(line2_point2, dtype=np.float32)
+
+    # 计算第一条直线的法向量（归一化）
+    dir1 = p2 - p1
+    norm1 = np.array([-dir1[1], dir1[0]], dtype=np.float32)
+    norm1 = norm1 / np.linalg.norm(norm1)
+
+    # 计算第二条直线的法向量（归一化）
+    dir2 = p4 - p3
+    norm2 = np.array([-dir2[1], dir2[0]], dtype=np.float32)
+    norm2 = norm2 / np.linalg.norm(norm2)
+
+    # 计算两条直线的交点（如果平行，交点计算会处理这种情况）
+    A = np.array([
+        [p2[0] - p1[0], p3[0] - p4[0]],
+        [p2[1] - p1[1], p3[1] - p4[1]]
+    ], dtype=np.float32)
+    b = np.array([
+        p3[0] - p1[0],
+        p3[1] - p1[1]
+    ], dtype=np.float32)
+
+    try:
+        # 尝试求解交点
+        t, s = np.linalg.solve(A, b)
+        intersection = p1 + t * (p2 - p1)
+        is_parallel = False
+    except np.linalg.LinAlgError:
+        # 直线平行，没有交点
+        intersection = np.array([0.0, 0.0], dtype=np.float32)  # 任意点
+        is_parallel = True
+
+    # 计算等距线的法向量
+    if is_parallel:
+        # 平行直线的等距线法向量与原直线相同
+        equidistant_normal = norm1
+        # 计算等距线的一个点（在两条直线中间）
+        mid_point = (p1 + p3) / 2
+    else:
+        # 非平行直线的等距线法向量是两条直线法向量的角平分线
+        equidistant_normal = (norm1 + norm2) / np.linalg.norm(norm1 + norm2)
+        # 等距线通过交点
+        mid_point = intersection
+
+    # 计算等距线的方向向量（垂直于法向量）
+    equidistant_dir = np.array([-equidistant_normal[1], equidistant_normal[0]], dtype=np.float32)
+
+    # 计算等距线上y=200和y=800的点
+    def calculate_point_on_line(mid_point, direction, target_y):
+        """计算直线上指定y坐标的点"""
+        if direction[1] == 0:  # 水平线，y坐标固定
+            return np.array([mid_point[0], target_y], dtype=np.float32)
+        else:
+            t = (target_y - mid_point[1]) / direction[1]
+            return mid_point + t * direction
+
+    point_y200 = calculate_point_on_line(mid_point, equidistant_dir, 100)
+    point_y800 = calculate_point_on_line(mid_point, equidistant_dir, 1200)
+
+
+   # 转换为整数点（四舍五入）
+    return np.round(point_y200).astype(int), np.round(point_y800).astype(int)
+
+def project_point_onto_line(point, line_point1, line_point2, distance=0):
+    """
+    计算点在直线上的投影点，并沿直线方向移动指定距离，返回整数坐标点
+
+    参数:
+    point: 需要投影的点，格式为[x, y]
+    line_point1, line_point2: 构成直线的两个点，格式为[x, y]
+    distance: 沿直线方向移动的距离（默认值为0，即仅返回投影点）
+
+    返回:
+    np.ndarray: 投影点沿直线移动后的整数坐标点，格式为[x, y]
+    """
+    # 转换为numpy数组
+    p = np.array(point)
+    a = np.array(line_point1)
+    b = np.array(line_point2)
+
+    # 计算直线方向向量
+    ab = b - a
+
+    # 计算点到直线起点的向量
+    ap = p - a
+
+    # 计算投影比例 t
+    t = np.dot(ap, ab) / np.dot(ab, ab)
+
+    # 计算投影点
+    projection = a + t * ab
+
+    # 如果需要移动距离，计算移动后的点
+    if distance != 0:
+        # 规范化方向向量
+        ab_normalized = ab / np.linalg.norm(ab)
+        # 沿直线方向移动指定距离
+        projection += ab_normalized * distance
+
+    # 转换为整数点（四舍五入）
+    return np.round(projection).astype(int)
+
+def closest_point_to_line(line_point1, line_point2, points):
+    """
+    计算点集到由两点定义的直线的距离，并返回最近的点
+
+    参数:
+    line_point1, line_point2: 定义直线的两个点，格式为 (x, y)
+    points: 待计算的点集，格式为列表或数组，每个点为 (x, y)
+
+    返回:
+    距离直线最近的点，格式为 (x, y)
+    """
+    # 将输入转换为 NumPy 数组以进行高效计算
+    p1 = np.array(line_point1)
+    p2 = np.array(line_point2)
+    points = np.array(points)
+
+    # 计算直线的向量
+    line_vec = p2 - p1
+
+    # 计算直线向量的长度平方
+    line_len_sq = np.sum(line_vec ** 2)
+
+    # 避免除零错误（如果两点重合，返回第一个点）
+    if line_len_sq == 0:
+        return p1
+
+    # 计算每个点到直线的距离
+    distances = []
+    for point in points:
+        # 计算点到直线的向量
+        point_vec = point - p1
+
+        # 计算投影比例 t
+        t = np.dot(point_vec, line_vec) / line_len_sq
+
+        # 点到直线的向量（垂直于直线）
+        projection = p1 + t * line_vec
+        distance_vec = point - projection
+
+        # 计算距离的平方
+        distance_sq = np.sum(distance_vec ** 2)
+        distances.append(distance_sq)
+
+    # 找到最小距离的索引
+    closest_index = np.argmin(distances)
+
+    # 返回最近的点
+    return tuple(points[closest_index])
+
+def get_upper_intersection(line, binary_image):
+    """
+    获取直线与二值化图像中白色区域的上方交点
+
+    参数:
+    line: 直线由两个点表示，格式为 [(x1, y1), (x2, y2)]
+    binary_image: 二值化图像，白色区域像素值为255，其他区域为0
+
+    返回:
+    上方交点坐标 (x, y)，如果没有交点则返回 None
+    """
+    x1, y1 = line[0]
+    x2, y2 = line[0]
+    x3, y3 = line[1]
+    x4, y4 = line[1]
+
+    contours, _ = cv2.findContours(binary_image.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CV_CHOICE)
+
+    intersections = []
+    for contour in contours:
+        for i in range(len(contour)):
+            x5, y5 = contour[i][0]
+            x6, y6 = contour[(i + 1) % len(contour)][0]
+
+            denominator = (x1 - x2) * (y5 - y6) - (y1 - y2) * (x5 - x6)
+            if denominator != 0:
+                ua = ((x1 - x5) * (y5 - y6) - (y1 - y5) * (x5 - x6)) / denominator
+                ub = ((x1 - x5) * (y1 - y2) - (y1 - y5) * (x1 - x2)) / denominator
+
+                if 0 <= ua <= 1 and 0 <= ub <= 1:
+                    x = x1 + ua * (x2 - x1)
+                    y = y1 + ua * (y2 - y1)
+                    intersections.append((x, y))
+
+    if intersections:
+        upper_intersection = min(intersections, key=lambda p: p[1])
+        return upper_intersection
+    else:
+        return None
+
+
+def fit_ellipse_least_squares(points):
+    """
+    使用最小二乘法拟合椭圆
+
+    参数:
+    points: 形状为(n, 2)的numpy数组，表示二维平面上的点
+
+    返回:
+    椭圆参数: ((cx, cy), (major, minor), angle)
+        - (cx, cy): 椭圆中心坐标
+        - (major, minor): 椭圆长轴和短轴长度
+        - angle: 椭圆旋转角度(度)
+    """
+    if len(points) < 5:
+        raise ValueError("至少需要5个点来拟合椭圆")
+
+    x, y = points[:, 0], points[:, 1]
+
+    # 构建设计矩阵
+    D = np.column_stack((x ** 2, x * y, y ** 2, x, y, np.ones_like(x)))
+
+    # 构建约束矩阵
+    C = np.zeros((6, 6))
+    C[0, 2], C[1, 1], C[2, 0] = 2, -1, 2  # 椭圆约束: 4ac - b² = 1
+
+    # 最小二乘求解
+    try:
+        # 计算SVD分解
+        U, S, Vt = np.linalg.svd(D, full_matrices=False)
+
+        # 构建对角矩阵S的逆
+        S_inv = np.diag(1.0 / S)
+
+        # 修复：使用正确的矩阵乘法顺序和维度
+        # 计算A = (D^T·D)^(-1)·D^T
+        A = Vt.T @ S_inv @ U.T
+
+        # 应用约束
+        C_inv = np.linalg.pinv(C)
+        W = C_inv @ (A @ D)
+
+        # 计算特征值和特征向量
+        eigenvalues, eigenvectors = np.linalg.eig(W)
+
+        # 选择符合椭圆约束的解
+        # 椭圆约束: 4ac - b² > 0
+        valid_indices = []
+        for i in range(len(eigenvalues)):
+            a, b, c, d, e, f = eigenvectors[:, i]
+            if 4 * a * c - b ** 2 > 0:
+                valid_indices.append(i)
+
+        if not valid_indices:
+            # 如果没有符合条件的解，选择特征值最小的解
+            idx = np.argmin(np.abs(eigenvalues))
+        else:
+            # 从符合条件的解中选择特征值最小的
+            valid_eigenvalues = eigenvalues[valid_indices]
+            min_idx = np.argmin(np.abs(valid_eigenvalues))
+            idx = valid_indices[min_idx]
+
+        a, b, c, d, e, f = eigenvectors[:, idx]
+
+        # 计算椭圆中心
+        denom = b ** 2 - 4 * a * c
+        cx = (2 * c * d - b * e) / denom
+        cy = (2 * a * e - b * d) / denom
+
+        # 计算旋转角度
+        angle = 0.5 * np.arctan2(b, a - c) * 180 / np.pi
+
+        # 计算长短轴
+        # 转换到中心坐标系
+        xc, yc = x - cx, y - cy
+        # 构建二次型矩阵
+        M = np.array([[a, b / 2], [b / 2, c]])
+        # 计算特征值
+        eigvals = np.linalg.eigvals(M)
+        # 确保特征值为正
+        eigvals = np.abs(eigvals)
+        # 计算行列式
+        det = a * c - (b / 2) ** 2
+        # 计算缩放因子
+        scale = np.sqrt(
+            np.abs((2 * (a * e ** 2 + c * d ** 2 + f * b ** 2 - b * d * e - a * c * f)) / (denom ** 2 * det)))
+        # 计算长短轴
+        major, minor = 2 * scale / np.sqrt(np.min(eigvals)), 2 * scale / np.sqrt(np.max(eigvals))
+
+        return ((cx, cy), (major, minor), angle)
+
+    except np.linalg.LinAlgError as e:
+        print(f"矩阵运算错误: {e}")
+        return None
+    except Exception as e:
+        print(f"发生未知错误: {e}")
+        return None
+def point_to_ellipse_distance_improved(point, ellipse):
+    (cx, cy), (a, b), angle = ellipse
+    x, y = point[0] - cx, point[1] - cy
+
+    theta = np.radians(-angle)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    x_rot, y_rot = x * cos_t - y * sin_t, x * sin_t + y * cos_t
+
+    a, b = a / 2, b / 2  # 转换为半轴
+
+    # 更智能的初始值选择
+    t = np.arctan2(y_rot * a, x_rot * b)
+
+    # 牛顿迭代
+    for _ in range(10):
+        cost, sint = np.cos(t), np.sin(t)
+        denominator = (a * cost) ** 2 + (b * sint) ** 2
+        x_ellipse, y_ellipse = a * cost, b * sint
+
+        # 计算导数和更新
+        df = 2 * (x_rot - x_ellipse) * a * sint + 2 * (y_rot - y_ellipse) * b * cost
+        f = (x_rot - x_ellipse) ** 2 + (y_rot - y_ellipse) ** 2
+
+        if df != 0:
+            t = t + f / df
+
+    x_ellipse, y_ellipse = a * np.cos(t), b * np.sin(t)
+    return np.sqrt((x_rot - x_ellipse) ** 2 + (y_rot - y_ellipse) ** 2)
+
+def point_to_ellipse_distance(point, ellipse):
+    """计算点到椭圆的精确距离"""
+    (cx, cy), (a, b), angle = ellipse
+    x, y = point[0] - cx, point[1] - cy
+
+    theta = np.radians(-angle)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    x_rot, y_rot = x * cos_t - y * sin_t, x * sin_t + y * cos_t
+
+    a, b = a / 2, b / 2  # 转换为半轴
+    t = np.arctan2(y_rot, x_rot)
+
+    for _ in range(10):  # 牛顿迭代
+        cost, sint = np.cos(t), np.sin(t)
+        denominator = (a * cost) ** 2 + (b * sint) ** 2
+        f = ((a * x_rot) / np.sqrt(denominator)) ** 2 + ((b * y_rot) / np.sqrt(denominator)) ** 2 - 1
+        df = -2 * (a * b) ** 2 * (a ** 2 - b ** 2) * x_rot * y_rot * np.sin(2 * t) / denominator ** 2
+        t = t - f / df if df != 0 else t
+
+    x_ellipse, y_ellipse = a * np.cos(t), b * np.sin(t)
+    return np.sqrt((x_rot - x_ellipse) ** 2 + (y_rot - y_ellipse) ** 2)
+
+
+def fit_ellipse_ransac(points, iterations=5500, threshold=10.0, inlier_ratio=0.05):
+    """使用RANSAC拟合椭圆"""
+    best_ellipse, best_inliers = None, 0
+
+
+
+
+
+
+    for _ in range(iterations):
+        # 随机采样5个点
+        sample = points[np.random.choice(len(points), 5, replace=False)]
+
+        try:
+            # 最小二乘法拟合椭圆
+            x, y = sample[:, 0], sample[:, 1]
+            D = np.column_stack((x * x, x * y, y * y, x, y, np.ones_like(x)))
+            C = np.zeros((6, 6))
+            C[0, 2], C[1, 1], C[2, 0] = 2, -1, 2
+            A = np.dot(np.linalg.inv(np.dot(D.T, D)), D.T)
+            V = np.linalg.eigvals(np.dot(np.linalg.inv(C), A))
+            idx = np.argmin(V)
+            a, b, c, d, e, f = np.linalg.eig(np.dot(np.linalg.inv(C), A))[:, idx]
+
+            # 计算椭圆参数
+            denom = b * b - 4 * a * c
+            cx, cy = (2 * c * d - b * e) / denom, (2 * a * e - b * d) / denom
+            angle = 0.5 * np.arctan2(b, a - c) * 180 / np.pi
+
+            M = np.array([[a, b / 2], [b / 2, c]])
+            eigvals = np.abs(np.linalg.eigvals(M))
+            scale = np.sqrt(np.abs((2 * (a * e * e + c * d * d + f * b * b - b * d * e - a * c * f)) / denom))
+            major, minor = 2 * scale / np.sqrt(min(eigvals)), 2 * scale / np.sqrt(max(eigvals))
+
+            ellipse = ((cx, cy), (major, minor), angle)
+
+            # 计算内点数量
+            distances = np.array([point_to_ellipse_distance_improved(p, ellipse) for p in points])
+            inliers = np.sum(distances < threshold)
+
+            # 更新最佳模型
+            if inliers > best_inliers and inliers > len(points) * inlier_ratio:
+                best_inliers, best_ellipse = inliers, ellipse
+
+        except:
+            continue
+
+    return best_ellipse
+
+
+
+def get_brightening_edges(image, sobel_ksize=3, threshold=50):
+    """
+    获取图像在y方向上从暗到亮的边缘
+
+    参数:
+    image -- 输入的二值图像（单通道，0为黑色，255为白色）
+    sobel_ksize -- Sobel算子的核大小
+    threshold -- 梯度阈值，用于筛选边缘
+
+    返回:
+    edges -- 二值边缘图像
+    """
+    # 1. 计算y方向的梯度
+    sobel_y = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=sobel_ksize)
+
+    # 2. 保留正向梯度（从暗到亮的过渡）
+    positive_gradient = np.maximum(sobel_y, 0)
+
+    # 3. 归一化梯度图像
+    gradient_norm = cv2.normalize(positive_gradient, None, 0, 255, cv2.NORM_MINMAX)
+    gradient_norm = np.uint8(gradient_norm)
+
+    # 4. 阈值处理提取强边缘
+    _, edges = cv2.threshold(gradient_norm, threshold, 255, cv2.THRESH_BINARY)
+
+    # 5. 结合原始图像，仅保留白色区域的边缘
+    # 从暗到亮的边缘应该位于白色区域的上边界
+    white_area = image.copy()
+    edges = cv2.bitwise_and(edges, white_area)
+
+    return edges
+
+
+def ransac_line_fit(binary_image, iterations=1000, threshold=10, inlier_ratio=0.2):
+    """
+    使用RANSAC算法从二值图像中拟合直线
+
+    参数:
+        binary_image (numpy.ndarray): 输入的二值图像(单通道，255表示前景)
+        iterations (int): RANSAC迭代次数
+        threshold (int): 点到直线的最大距离阈值，小于此值的点为内点
+        inlier_ratio (float): 判断模型是否有效的最小内点比例
+
+    返回:
+        tuple: (成功标志, 最佳拟合直线参数, 耗时(毫秒))
+               成功标志为True/False，表示是否成功拟合直线
+               直线参数为(x1, y1, x2, y2)，表示直线的两个端点坐标
+    """
+    # 记录开始时间（微秒级精度）
+    start_time = time.perf_counter()
+
+    # 提取前景像素坐标
+    points = np.column_stack(np.where(binary_image > 0)[::-1])  # [::-1]是为了将(y,x)转为(x,y)
+    print(f"提取到的前景像素坐标数量: {len(points)}")
+
+    # 如果点太少，直接返回失败
+    if len(points) < 10:
+        end_time = time.perf_counter()
+        elapsed_time = (end_time - start_time) * 1000  # 转换为毫秒
+        return False, None, elapsed_time
+
+    # 均匀选取100个点
+    selected_indices = np.linspace(0, len(points) - 1, 100, dtype=int)
+    points = points[selected_indices]
+    print(f"均匀选取的点数量: {len(points)}")
+
+    # 创建彩色图像用于可视化
+    vis_image = cv2.cvtColor(binary_image, cv2.COLOR_GRAY2BGR)
+
+    # 在图像上绘制所有点（原始点用浅蓝色，小尺寸）
+    for x, y in points:
+        cv2.circle(vis_image, (x, y), 1, (255, 255, 0), -1)  # 浅蓝色
+
+    #cv2.imshow('RANSAC直线拟合 - 选点结果', vis_image)
+    #cv2.waitKey(0)
+    # 使用 cv2.fitLine 拟合直线UH
+
+    # 使用OpenCV的fitLine函数拟合直线（使用RANSAC方法）
+    [vx, vy, x, y] = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
+
+    # 提取标量值
+    vx, vy, x, y = vx[0], vy[0], x[0], y[0]
+
+    # 计算直线上的两个点，用于绘制直线（扩展到图像边界）
+    height, width = binary_image.shape[:2]
+
+    # 计算直线与图像上下边界的交点
+    if vy != 0:  # 避免除以零
+        y1 = 0
+        x1 = int(x + (y1 - y) * vx / vy)
+
+        y2 = height - 1
+        x2 = int(x + (y2 - y) * vx / vy)
+
+        # 确保点在图像范围内
+        if x1 < 0:
+            x1 = 0
+            y1 = int(y + (x1 - x) * vy / vx)
+        elif x1 >= width:
+            x1 = width - 1
+            y1 = int(y + (x1 - x) * vy / vx)
+
+        if x2 < 0:
+            x2 = 0
+            y2 = int(y + (x2 - x) * vy / vx)
+        elif x2 >= width:
+            x2 = width - 1
+            y2 = int(y + (x2 - x) * vy / vx)
+    else:  # 垂直线的情况
+        x1 = int(x)
+        y1 = 0
+        x2 = int(x)
+        y2 = height - 1
+
+    # 计算内点数量，判断拟合是否成功
+    a = vy
+    b = -vx
+    c = vx * y - vy * x
+    distances = np.abs(a * points[:, 0] + b * points[:, 1] + c) / np.sqrt(a * a + b * b)
+    inliers = points[distances < threshold]
+    inlier_count = len(inliers)
+
+    success = inlier_count >= len(points) * inlier_ratio
+    print(f"内点数量: {inlier_count}, 拟合成功: {success}")
+
+    # 记录结束时间并计算耗时（毫秒）
+    end_time = time.perf_counter()
+    elapsed_time = (end_time - start_time) * 1000  # 转换为毫秒
+    print(f"RANSAC拟合耗时: {elapsed_time:.2f} 毫秒")
+
+    return success, (x1, y1, x2, y2), elapsed_time
+
+def get_rectangular_roi_only(image, x, y, width, height):
+    """
+    获取黑白图像的副本，仅保留矩形ROI区域，其他地方全黑
+
+    参数:
+    image -- 输入的黑白图像（单通道）
+    x, y -- ROI左上角坐标
+    width, height -- ROI的宽度和高度
+
+    返回:
+    result -- 处理后的图像，仅保留ROI区域，其他地方为黑色
+    """
+    # 创建全黑掩码
+    mask = np.zeros_like(image)
+
+    # 在掩码上绘制白色矩形ROI
+    cv2.rectangle(mask, (x, y), (x + width, y + height), 255, -1)
+
+    # 应用掩码，保留ROI区域
+    result = cv2.bitwise_and(image, mask)
+    return result
+
+def rotate_rotated_rect(rect, angle_degrees, pivot_point):
+    """
+    将旋转矩形绕指定点旋转指定角度
+
+    参数:
+    rect: 原始旋转矩形，格式为 ((cx, cy), (width, height), angle)
+    angle_degrees: 旋转角度（度），正值表示逆时针旋转
+    pivot_point: 旋转中心点 (px, py)
+
+    返回:
+    新的旋转矩形，格式为 ((cx, cy), (width, height), angle)
+    """
+    # 解包旋转矩形参数
+    (cx, cy), (width, height), rect_angle = rect
+    (px, py) = pivot_point
+
+    # 将角度转换为弧度
+    angle_radians = np.radians(angle_degrees)
+
+    # 计算旋转后的中心点
+    dx = cx - px
+    dy = cy - py
+    new_cx = px + dx * np.cos(angle_radians) - dy * np.sin(angle_radians)
+    new_cy = py + dx * np.sin(angle_radians) + dy * np.cos(angle_radians)
+
+    # 计算新的旋转角度
+    new_angle = rect_angle + angle_degrees
+
+    # 规范化角度到 [-90, 0) 区间（OpenCV 标准）
+    while new_angle < -90:
+        new_angle += 180
+    while new_angle >= 0:
+        new_angle -= 180
+
+    return ((new_cx, new_cy), (width, height), new_angle)
+
+def rotate_image(image, angle, center=None):
+    """
+    旋转图像
+    :param image: 输入图像 (numpy array)
+    :param angle: 旋转角度 (度)
+    :param center: 旋转中心点 (tuple), 默认是图像中心
+    :return: 旋转后的图像
+    """
+    # 获取图像尺寸
+    (h, w) = image.shape[:2]
+
+    # 如果未指定中心点，则使用图像中心
+    if center is None:
+        center = (w // 2, h // 2)
+    if angle >45:
+        angle = angle-90
+    # 计算旋转矩阵
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+    # 执行旋转并处理边界
+    cos = np.abs(M[0, 0])
+    sin = np.abs(M[0, 1])
+
+    # 计算新图像的宽度和高度
+    nW = int((h * sin) + (w * cos))
+    nH = int((h * cos) + (w * sin))
+
+    # 调整旋转矩阵的平移部分
+    M[0, 2] += (nW / 2) - center[0]
+    M[1, 2] += (nH / 2) - center[1]
+
+    # 执行仿射变换
+    rotated = cv2.warpAffine(image, M, (nW, nH))
+
+    return rotated
+
+
+def generate_parallel_rectangles(rotated_rect):
+    """
+    生成两个平行于输入旋转矩形的新旋转矩形
+
+    参数:
+    rotated_rect -- 输入的旋转矩形，格式为((center_x, center_y), (width, height), angle)
+
+    返回:
+    rect1, rect2 -- 两个新的旋转矩形
+    """
+    # 获取旋转矩形的四个顶点
+    box = cv2.boxPoints(rotated_rect)
+    a, b, c, d = box.astype(int)
+
+    # 计算线段ab的方向向量
+    ab_vector = b - a
+    ab_length = np.linalg.norm(ab_vector)
+    ab_direction = ab_vector / ab_length
+
+    # 计算垂直于ab的方向向量（用于偏移）
+    normal_direction = np.array([-ab_direction[1], ab_direction[0]])
+
+    # 计算偏移量（5个像素）
+    offset = 5
+
+    # 生成矩形1的顶点
+    a1 = a
+    b1 = b
+    # 在线段ac上找到c1点，使其与a1b1的距离为offset
+    ac_vector = c - a
+    ac_length = np.linalg.norm(ac_vector)
+    ac_direction = ac_vector / ac_length
+
+    # 计算c1点的位置
+    projection_length = np.dot(normal_direction * offset, ac_direction)
+    c1 = a + ac_direction * projection_length
+
+    # 在线段bd上找到d1点，使其与b1c1的距离为offset
+    bd_vector = d - b
+    bd_length = np.linalg.norm(bd_vector)
+    bd_direction = bd_vector / bd_length
+
+    # 计算d1点的位置
+    d1 = b + bd_direction * projection_length
+
+    # 生成矩形2的顶点
+    c2 = c
+    d2 = d
+    # 在线段ac上找到a2点，使其与c2d2的距离为offset
+    a2 = c - ac_direction * (ac_length - projection_length)
+
+    # 在线段bd上找到b2点，使其与d2a2的距离为offset
+    b2 = d - bd_direction * (bd_length - projection_length)
+
+    # 将顶点转换为旋转矩形格式
+    def points_to_rotated_rect(points):
+        # 计算中心点
+        center = np.mean(points, axis=0)
+        # 计算宽度和高度
+        width = np.linalg.norm(points[1] - points[0])
+        height = np.linalg.norm(points[2] - points[1])
+        # 计算角度
+        angle = np.arctan2(points[1][1] - points[0][1], points[1][0] - points[0][0]) * 180 / np.pi
+        return ((center[0], center[1]), (width, height), angle)
+
+    # 创建矩形1的四个顶点
+    rect1_points = np.array([a1, b1, d1, c1], dtype=np.float32)
+    rect1 = points_to_rotated_rect(rect1_points)
+
+    # 创建矩形2的四个顶点
+    rect2_points = np.array([a2, b2, d2, c2], dtype=np.float32)
+    rect2 = points_to_rotated_rect(rect2_points)
+
+    return rect1, rect2
+def get_rotated_rect_edges(image, rotated_rect, edge_width=5):
+    """
+    获取带角度矩形框的左右边缘，并提取边缘宽度为指定像素的旋转 ROI
+
+    参数:
+    image (np.ndarray): 输入图像
+    rotated_rect (tuple): 带角度的矩形框，格式为 ((center_x, center_y), (width, height), angle)
+    edge_width (int): 边缘宽度，默认为5像素
+
+    返回:
+    tuple: 左右边缘的旋转 ROI 图像
+    """
+    # 解包旋转矩形参数
+    (cx, cy), (width, height), angle = rotated_rect
+
+    # 创建掩码
+    mask = np.zeros_like(image)
+
+    # 绘制旋转矩形
+    box = cv2.boxPoints(rotated_rect)
+    box = np.intp(box)
+    cv2.drawContours(mask, [box], 0, (255, 255, 255), -1)
+
+    # 计算左右边缘的旋转矩形
+    # 左边缘
+    left_rect = ((cx - width / 4, cy), (edge_width, height), angle)
+    # 右边缘
+    right_rect = ((cx + width / 4, cy), (edge_width, height), angle)
+
+    # 提取左右边缘的 ROI
+    def extract_roi(rect):
+        # 获取矩形的四个顶点
+        box = cv2.boxPoints(rect)
+        box = np.int0(box)
+
+        # 计算最小外接矩形
+        min_rect = cv2.minAreaRect(box)
+        width, height = min_rect[1]
+
+        # 计算变换矩阵并进行仿射变换
+        src_pts = box.astype("float32")
+        dst_pts = np.array([
+            [0, height - 1],
+            [0, 0],
+            [width - 1, 0],
+            [width - 1, height - 1]
+        ], dtype="float32")
+
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        warped = cv2.warpPerspective(image, M, (int(width), int(height)))
+
+        return warped
+
+    left_roi = extract_roi(left_rect)
+    right_roi = extract_roi(right_rect)
+
+    return left_roi, right_roi
+
+def split_rotated_rect(rotated_rect, left_width, right_width):
+    """
+    将一个带角度的矩形框分割为两个子矩形
+
+    参数:
+    rotated_rect: 输入的旋转矩形，格式为((cx, cy), (width, height), angle)
+    left_width: 左子矩形的宽度
+    right_width: 右子矩形的宽度
+
+    返回:
+    left_sub_rect: 左子矩形，格式为((cx, cy), (width, height), angle)
+    right_sub_rect: 右子矩形，格式为((cx, cy), (width, height), angle)
+    """
+    # 验证输入
+    (cx, cy), (width, height), angle = rotated_rect
+
+    # 调整角度到标准范围 (-180°, 180°]
+    angle_rad = np.deg2rad(angle % 180)
+
+    # 计算旋转后的方向向量
+    direction_x = np.cos(angle_rad)
+    direction_y = np.sin(angle_rad)
+
+    # 计算左右子矩形的中心点偏移量
+    left_offset = (width / 2 - left_width / 2)
+    right_offset = (width / 2 - right_width / 2)
+
+    # 计算左右子矩形的中心点
+    left_cx = cx - left_offset * direction_x
+    left_cy = cy - left_offset * direction_y
+    right_cx = cx + right_offset * direction_x
+    right_cy = cy + right_offset * direction_y
+
+    # 创建左右子矩形
+    left_sub_rect = ((left_cx, left_cy), (left_width, height), angle)
+    right_sub_rect = ((right_cx, right_cy), (right_width, height), angle)
+
+    return left_sub_rect, right_sub_rect
+def split_rotated_rect3(rotated_rect, left_width, right_width):
+    """
+    将一个带角度的矩形框分割为两个子矩形
+
+    参数:
+    rotated_rect: 输入的旋转矩形，格式为((cx, cy), (width, height), angle)
+    left_width: 左子矩形的宽度
+    right_width: 右子矩形的宽度
+
+    返回:
+    left_sub_rect: 左子矩形，格式为((cx, cy), (width, height), angle)
+    right_sub_rect: 右子矩形，格式为((cx, cy), (width, height), angle)
+    """
+    # 解析输入的旋转矩形
+    (cx, cy), (width, height), angle = rotated_rect
+
+    # 计算矩形的四个顶点
+    box = cv2.boxPoints(rotated_rect)
+    box = np.intp(box)
+
+    # 找到最左边和最右边的点
+    left_most = np.argmin(box[:, 0])
+    right_most = np.argmax(box[:, 0])
+
+    # 计算矩形的方向向量
+    direction = np.deg2rad(angle)
+    cos_angle = np.cos(direction)
+    sin_angle = np.sin(direction)
+
+    # 计算左子矩形的中心点
+    left_cx = cx - (width / 2 - left_width / 2) * cos_angle
+    left_cy = cy - (width / 2 - left_width / 2) * sin_angle
+
+    # 计算右子矩形的中心点
+    right_cx = cx + (width / 2 - right_width / 2) * cos_angle
+    right_cy = cy + (width / 2 - right_width / 2) * sin_angle
+    print("angle",angle)
+    # 创建左右子矩形
+    left_sub_rect = ((left_cx, left_cy), (left_width, height), angle)
+    right_sub_rect = ((right_cx, right_cy), (right_width, height), angle)
+
+    return left_sub_rect, right_sub_rect
+
+def get_axis_aligned_bounding_box(binary_image, min_area=100, print_info=False, draw_box=False):
+
+    # 确保输入是二值图像
+    _, binary = cv2.threshold(binary_image, 127, 255, cv2.THRESH_BINARY)
+
+    # 查找所有连通区域
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # 检查是否有足够的轮廓
+    if not contours:
+        if print_info:
+            print("警告: 未检测到前景轮廓")
+        return None
+
+    # 将所有轮廓点合并为一个点集
+    all_points = np.vstack(contours).squeeze()
+
+    # 计算整体的直立边界框
+    x, y, w, h = cv2.boundingRect(all_points)
+
+    # 计算边界框面积
+    box_area = w * h
+
+    # 过滤小面积区域
+    if box_area < min_area:
+        if print_info:
+            print(f"警告: 边界框面积({box_area:.2f})小于阈值({min_area})")
+        return None
+
+    # 打印边界框信息
+    if print_info:
+        print(f"全局直立边界框:")
+        print(f"  左上角: ({x:.2f}, {y:.2f})")
+        print(f"  尺寸:   ({w:.2f}, {h:.2f})")
+        print(f"  面积:   {box_area:.2f} 像素²")
+
+    # 绘制边界框
+    if draw_box:
+        # 创建彩色图像用于绘制
+        vis_image = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+        # 绘制边界框
+        cv2.rectangle(vis_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+        # 标记中心点
+        cx, cy = x + w // 2, y + h // 2
+        cv2.circle(vis_image, (cx, cy), 5, (0, 0, 255), -1)
+
+        # 显示结果
+        cv2.imshow('全局直立边界框', vis_image)
+        cv2.waitKey(0)
+
+    return (x, y, w, h)
+
+def get_min_rotated_rectangles(binary_image, min_area=100):
+    # 确保输入是二值图像
+    _, binary = cv2.threshold(binary_image, 127, 255, cv2.THRESH_BINARY)
+
+    # 查找所有连通区域
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # 检查是否有足够的轮廓
+    if not contours:
+        return None
+
+    # 将所有轮廓点合并为一个点集
+    all_points = np.vstack(contours).squeeze()
+
+    # 计算整体的最小外接矩形
+    global_rect = cv2.minAreaRect(all_points)
+
+    # 计算整体轮廓面积
+    global_area = cv2.contourArea(all_points)
+
+    # 过滤小面积区域
+    if global_area < min_area:
+        return None
+
+
+    (cx, cy), (w, h), angle = global_rect
+    #print(f"全局最小外接矩形:")
+    print(f"  中心点: ({cx:.2f}, {cy:.2f})")
+    #print(f"  尺寸:   ({w:.2f}, {h:.2f})")
+    print(f"  角度:   {angle:.2f}°")
+    #print(f"  面积:   {w * h:.2f} 像素²")
+    #print(f"  轮廓面积: {global_area:.2f} 像素²")
+    return global_rect
+
+    # 绘制矩形
+    if  global_rect is not None:
+        # 创建彩色图像用于绘制
+        vis_image = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+        # 获取矩形的四个顶点
+        box = cv2.boxPoints(global_rect)
+        # 推荐修改为
+        box = np.intp(box)  # 转换为整数坐标
+
+        # 绘制矩形
+        cv2.drawContours(vis_image, [box], 0, (0, 255, 0), 2)
+
+        # 标记中心点
+        cx, cy = int(global_rect[0][0]), int(global_rect[0][1])
+        cv2.circle(vis_image, (cx, cy), 5, (0, 0, 255), -1)
+
+        # 显示结果
+        cv2.imshow('全局最小外接矩形', vis_image)
+        cv2.waitKey(0)
+
+    return global_rect
+
+
+
+def detect_longest_lines(image, threshold=100, min_line_length=50, max_line_gap=10):
+    """
+    通过霍夫变换检测图像中最长的两条直线
+
+    参数:
+        image (numpy.ndarray): 输入图像(单通道)
+        threshold (int): 霍夫变换阈值，线段投票数需超过此值才被检测
+        min_line_length (int): 最小线段长度，短于此的线段会被忽略
+        max_line_gap (int): 线段最大间隔，小于此间隔的线段会被合并
+
+    返回:
+        list: 包含两条最长直线的列表，每条直线由两个点表示[(x1,y1),(x2,y2)]
+    """
+    # 应用概率霍夫变换
+    lines = cv2.HoughLinesP(
+        image,
+        rho=1,  # 距离精度(像素)
+        theta=np.pi / 180,  # 角度精度(弧度)
+        threshold=threshold,
+        minLineLength=min_line_length,
+        maxLineGap=max_line_gap
+    )
+
+    # 如果没有检测到直线，返回空列表
+    if lines is None:
+        return []
+
+    # 计算每条直线的长度并排序
+    lines = lines[:, 0, :]  # 形状从 [N, 1, 4] 变为 [N, 4]
+    line_lengths = []
+
+    for x1, y1, x2, y2 in lines:
+        length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        line_lengths.append((length, (x1, y1, x2, y2)))
+
+    # 按长度降序排序
+    line_lengths.sort(key=lambda x: x[0], reverse=True)
+
+    # 返回最长的两条直线
+    return [line[1] for line in line_lengths[:2]]
+
+
+def opening(binary_image, kernel_size=3):
+    # 确保输入是二值图像
+    _, binary = cv2.threshold(binary_image, 127, 255, cv2.THRESH_BINARY)
+
+    # 创建椭圆结构元素
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+
+    # 开运算：先腐蚀后膨胀，去除小物体
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+    return opened
+
+def closing(binary_image, kernel_size=3):
+
+    # 确保输入是二值图像
+    _, binary = cv2.threshold(binary_image, 127, 255, cv2.THRESH_BINARY)
+
+    # 创建椭圆结构元素
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+
+    # 闭运算：先膨胀后腐蚀，填充内部小孔
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    return closed
+
+
+def filter_by_aspect_ratio(binary_image, min_aspect_ratio=1.0):
+    """
+    按长宽比过滤二值图像中的区域，保留长宽比大于等于指定值的区域
+
+    参数:
+        binary_image (numpy.ndarray): 输入的二值图像(单通道，255表示前景)
+        min_aspect_ratio (float): 保留区域的最小长宽比(宽/高)，默认1.0(正方形)
+
+    返回:
+        numpy.ndarray: 过滤后的二值图像
+    """
+    # 确保输入是二值图像
+    _, binary = cv2.threshold(binary_image, 127, 255, cv2.THRESH_BINARY)
+
+    # 查找所有连通区域
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # 创建结果图像
+    result = np.zeros_like(binary)
+
+    # 绘制符合条件的区域
+    for contour in contours:
+        # 计算边界框
+        x, y, w, h = cv2.boundingRect(contour)
+
+        # 计算长宽比(宽/高)
+        aspect_ratio = float(h) / w if w > 0 else float('inf')
+
+        # 保留长宽比大于等于阈值的区域
+        if aspect_ratio >= min_aspect_ratio:
+            cv2.drawContours(result, [contour], -1, 255, -1)
+
+    return result
+
+
+def remove_small_regions(binary_image, area_threshold):
+     # 确保输入是二值图像
+    _, binary = cv2.threshold(binary_image, 127, 255, cv2.THRESH_BINARY)
+
+    # 查找所有连通区域
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # 创建结果图像
+    result = np.zeros_like(binary)
+
+    # 绘制符合条件的区域
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area >= area_threshold:
+            cv2.drawContours(result, [contour], -1, 255, -1)
+
+    return result
+
+
+def ProcessImg(image):
+    # 记录结束时间（以秒为单位）
+    start_time = time.time()
+
+    key_points = [
+        (200, 200),  # 索引0
+        (600, 200),  # 索引1
+        (200, 600),  # 索引2
+        (600, 600),  # 索引3
+        (400, 400),  # 索引4
+        (400, 400),  # 索引5
+    ]
+    # 转换为HSV颜色空间
+    hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    # 分离通道，获取纯度(Saturation)通道
+    _, s, _ = cv2.split(hsv_image)
+
+
+
+    # 对饱和度通道进行反色
+    s = 255 - s
+
+
+
+    #二值化，提取边缘
+    _, s = cv2.threshold(s, 170  , 255, cv2.THRESH_BINARY)
+
+
+    # 只关注ROI区域
+    mask = np.zeros_like(s)
+    mask[150:1080, 140:850] = 255
+    s = cv2.bitwise_and(s, s, mask=mask)
+
+    #s =  opening(s ,4)
+
+    s_ori =remove_small_regions(s,20   )
+
+    x, y, w, h = get_axis_aligned_bounding_box(s)
+    mask2 = np.zeros_like(s)
+    y = y+150
+    #h = h-300
+    mask2[y:y+h,x:x+w] = 255
+
+    s = cv2.bitwise_and(s_ori, s_ori, mask=mask2)
+
+    global_rect = get_min_rotated_rectangles(s)
+
+    (cx, cy), (w, h), angle = global_rect
+    # 旋转30度，以(100, 100)为旋转点
+    image = rotate_image(image, angle, (cx, cy))
+
+    s = rotate_image(s, angle, (cx, cy))
+    s_ori = rotate_image(s_ori, angle, (cx, cy))
+
+    x, y, w, h = get_axis_aligned_bounding_box(s)
+    x0, y0, w0, h0 = get_axis_aligned_bounding_box(s_ori)
+
+    # 执行旋转
+    global_rect = rotate_rotated_rect(global_rect, -angle, (cx, cy))
+
+    # 绘制边界框
+
+    #cv2.rectangle(image, (x, y0), (x + w, y0 + int(1.6*w)), (0, 255, 0), 2)
+    #cv2.rectangle(s_ori, (x, y0), (x + w, y0 + int(1.6*w)), (255, 255, 255), 2)
+
+    left_edge =  get_rectangular_roi_only(s_ori,x-3,y0 + int(0.3*w),12,y0 + int(0.8*w))
+    right_edge =  get_rectangular_roi_only(s_ori,x + w-9,y0 + int(0.3*w),12,y0 + int(0.8*w))
+
+
+    left_edge_ori =  get_rectangular_roi_only(s_ori,x-12,y0 ,24,y0 + int(0.8*w))
+    right_edge_ori =  get_rectangular_roi_only(s_ori,x + w-12,y0 ,24,y0 + int(0.8*w))
+
+    # 分离通道
+    _, _, TopRoi_R = cv2.split(image)
+
+    TopRoi = get_rectangular_roi_only(TopRoi_R, x0, y0-20, w0, int(0.2*w0))
+    _, TopRoi = cv2.threshold(TopRoi, 180, 255, cv2.THRESH_BINARY)
+
+    _, TopRoi_D = cv2.threshold(TopRoi_R, 180, 255, cv2.THRESH_BINARY)
+
+    #cv2.imshow('TopRoi_R', TopRoi_D)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # 获取y方向从暗到亮的边缘
+    #edges = get_brightening_edges(TopRoi)
+    #cv2.imshow('edges', edges)
+
+    # 创建椭圆结构元素
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+    # 闭运算：先膨胀后腐蚀，填充内部小孔
+    TopRoi_er = cv2.morphologyEx(TopRoi, cv2.MORPH_ERODE, kernel)
+    TopRoi_di = cv2.morphologyEx(TopRoi, cv2.MORPH_DILATE, kernel)
+    # 直接减法（保留正值部分）
+    subtracted = cv2.subtract(TopRoi_di, TopRoi_er)
+
+    TopRoi = get_rectangular_roi_only(subtracted, x0, y0-10, w0, int(0.07*w0))
+    TopRoi =remove_small_regions(TopRoi,20   )
+
+    points = np.column_stack(np.where(TopRoi > 0)[::-1])  # [::-1]是为了将(y,x)转为(x,y)
+
+
+
+
+
+
+
+
+
+
+    print(f"开始拟合")
+
+    # 使用RANSAC拟合直线
+    success, line, elapsed_time = ransac_line_fit(left_edge, iterations=1000, threshold=1)
+
+    line1 =line
+
+    # 在彩色图像上绘制拟合的直线
+    if success:
+        x1, y1, x2, y2 = line
+        left_edge    = cv2.cvtColor(left_edge_ori, cv2.COLOR_GRAY2BGR)
+
+        # 计算最近点
+        closest = closest_point_to_line((x1, y1), (x2, y2), points)
+        # 计算投影点
+        projection = project_point_onto_line(closest, (x1, y1), (x2, y2),distance=0.17*w0)
+        # 解析元组
+        xa, ya = projection
+        #cv2.circle(image, (xa, ya), 5, (0,255,  0), -1)
+
+
+        key_points[0] = (xa, ya)
+
+        projection = project_point_onto_line(closest, (x1, y1), (x2, y2),distance=1.43*w0)
+        # 解析元组
+        xa, ya = projection
+        #cv2.circle(image, (xa, ya), 5, (0,255,  233), -1)
+
+        key_points[5] = (xa, ya)
+
+
+        print(f"直线端点: ({x1}, {y1}) - ({x2}, {y2})")
+        cv2.circle(left_edge, (xa, ya), 5, (255, 255, 255), -1)
+
+        # 绘制拟合的直线
+        #cv2.line(image, (xa, ya), (x2, y2), (255, 0,0), 1)  # 红色直线
+        #cv2.line(TopRoi, (x1, y1), (x2, y2), (0, 0, 0), 10)  # 红色直线
+        # 在图像上显示耗时信息
+        cv2.putText(left_edge, f"RANSAC耗时: {elapsed_time:.2f} ms",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+    # 使用RANSAC拟合直线
+    success, line, elapsed_time = ransac_line_fit(right_edge, iterations=1000, threshold=1)
+    # 在彩色图像上绘制拟合的直线
+    if success:
+        x1, y1, x2, y2 = line
+        line2 = line
+
+        print(f"直线端点: ({x1}, {y1}) - ({x2}, {y2})")
+        right_edge    = cv2.cvtColor(right_edge_ori, cv2.COLOR_GRAY2BGR)
+
+        # 计算最近点
+        closest = closest_point_to_line((x1, y1), (x2, y2), points)
+        # 计算投影点
+        projection = project_point_onto_line(closest, (x1, y1), (x2, y2),distance=0.17*w0)
+        # 解析元组
+        xa, ya = projection
+        #cv2.circle(image, (xa, ya), 5, (0,255,  0), -1)
+
+        key_points[2] = (xa, ya)
+        projection = project_point_onto_line(closest, (x1, y1), (x2, y2),distance=1.43*w0)
+        # 解析元组
+        xa, ya = projection
+        #cv2.circle(image, (xa, ya), 5, (0,255,  0), -1)
+        key_points[3] = (xa, ya)
+
+
+
+
+        print(f"直线端点: ({x1}, {y1}) - ({x2}, {y2})")
+        cv2.circle(left_edge, (xa, ya), 5, (255, 255, 255), -1)
+
+
+        # 绘制拟合的直线
+        #cv2.line(image, (xa, ya), (x2, y2), (255,0,  0), 1)  # 红色直线
+        #cv2.line(TopRoi, (x1, y1), (x2, y2), (0, 0, 0), 10)  # 红色直线
+
+        # 在图像上显示耗时信息
+        cv2.putText(right_edge, f"RANSAC耗时: {elapsed_time:.2f} ms",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+
+        x1_1, y1_1, x1_2, y1_2 = line1
+        x2_1, y2_1, x2_2, y2_2 = line2
+
+        # 计算等距线
+        p1, p2 = get_equidistant_line((x1_1, y1_1),(x1_2, y1_2),(x2_1, y2_1),(x2_2, y2_2))
+
+
+        # 计算最近点
+        closest = closest_point_to_line(p1, p2,points)
+        # 计算投影点
+        projection = project_point_onto_line(closest, p1, p2,distance=0.17*w0)
+
+        xa, ya = projection
+        key_points[1] = (xa, ya)
+        #cv2.circle(image, (xa, ya), 5,  (0, 255, 0), -1)
+
+        #cv2.line(image, (xa, ya), p2, (255, 0,0), 1)  # 红色直线
+
+        projection = project_point_onto_line((xa, ya), (xa, ya), p2, distance=1.32 * w0)
+        #cv2.circle(image, projection, 5, (0, 255, 0), -1)
+        xa, ya = projection
+
+        key_points[4] = (xa, ya)
+
+    for index, point in enumerate(key_points):
+        print(f"点 {index}: ({point[0]}, {point[1]})")
+
+    # 将点的坐标转换为百分比形式（相对于图像宽度和高度）
+    height, width = image.shape[:2]
+    percent_points = [[x / width, y / height] for x, y in key_points]
+    print("Percent Points:")
+    for point in percent_points:
+        print(point)
+
+
+
+   # 初始化 LabelUnwrapper
+    unwrapper = LabelUnwrapper(src_image=image, percent_points=percent_points)
+
+    # 绘制标签的轮廓
+    unwrapper.draw_mask(color=YELLOW_COLOR, thickness=1)
+
+    # 绘制网格
+    unwrapper.draw_mesh(color=GREEN_COLOR, thickness=3                      )
+
+    # 记录展开操作开始的时间，单位为毫秒
+    start_time_ms = time.perf_counter_ns() // 1_000_000
+
+    dst_image = unwrapper.unwrap()
+
+    # 记录展开操作结束的时间，单位为毫秒
+    end_time_ms = time.perf_counter_ns() // 1_000_000
+    elapsed_time_ms = end_time_ms - start_time_ms  # 计算耗时，单位为毫秒
+
+    print(f"Label unwrapping took {elapsed_time_ms:.4f} milliseconds.")  # 打印耗时，单位为毫秒
+
+    # 显示绘制了轮廓和网格的原始图像
+    cv2.namedWindow("Image with Mask and Mesh", cv2.WINDOW_NORMAL)
+    # 设置窗口的初始大小，保持图像的真实比例
+    scale_percent = 800 / unwrapper.src_image.shape[0]  # 初始缩放百分比
+    width = int(unwrapper.src_image.shape[1] * scale_percent)
+    height = int(unwrapper.src_image.shape[0] * scale_percent)
+    cv2.resizeWindow("Image with Mask and Mesh", width, height)
+    cv2.imshow("Image with Mask and Mesh", unwrapper.src_image)
+
+    # 显示展开后的图像
+    cv2.namedWindow("Unwrapped Image", cv2.WINDOW_NORMAL)
+    # 设置窗口的初始大小，保持图像的真实比例
+    scale_percent = 800 / dst_image.shape[0]  # 初始缩放百分比
+    width = int(dst_image.shape[1] * scale_percent)
+    height = int(dst_image.shape[0] * scale_percent)
+    cv2.resizeWindow("Unwrapped Image", width, height)
+    cv2.imshow("Unwrapped Image", dst_image)
+
+
+    # 去除小点
+
+    #按照长宽比去除
+    #s = filter_by_aspect_ratio(s,0.5)
+
+    # 记录结束时间（以秒为单位）
+    end_time = time.time()
+
+    # 计算耗时（以秒为单位）
+    elapsed_time = end_time - start_time
+
+    # 将耗时转换为毫秒
+    elapsed_time_ms = elapsed_time * 1000
+
+    #cv2.imshow('left_edge', left_edge)
+    #cv2.imshow('right_edge', right_edge)
+    #cv2.imshow('TopRoi', TopRoi)
+
+    # 标记中心点
+    cx, cy = int(global_rect[0][0]), int(global_rect[0][1])
+    cv2.circle(image, (cx, cy), 5, (0, 0, 255), -1)
+
+    print(f"算法耗时: {elapsed_time_ms:.2f} 毫秒")
+    # 显示原始图像和HSV图像
+    #cv2.imshow('origin', image)
+    #cv2.imshow('s', s)
+    #cv2.imshow('s_ori', s_ori)
+
+
+
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+    return dst_image,unwrapper.src_image
+
+
+def convert_to_hsv_and_display(image_path):
+    """读取图像并转换为HSV通道显示，支持中文路径"""
+    try:
+        # 支持中文路径的读取方法
+        with open(image_path, 'rb') as f:
+            img_data = f.read()
+        # 将字节数据转换为numpy数组
+        nparr = np.frombuffer(img_data, np.uint8)
+        # 解码为图像
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if image is None:
+            print(f"警告: 无法读取图像 {image_path}")
+            return
+
+        Unimage,stateImage = ProcessImg(image)
+        # 生成保存路径
+        # 分离文件名和扩展名
+        file_dir, file_full_name = os.path.split(image_path)
+        file_name, file_ext = os.path.splitext(file_full_name)
+
+        # 构建保存路径，添加"_unwarp"后缀
+        save_path = os.path.join(file_dir, f"{file_name}_unwarp{file_ext}")
+
+        # 保存处理后的图像
+        # 确保中文路径能正常保存
+        cv2.imencode(file_ext, Unimage)[1].tofile(save_path)
+
+
+        # 构建保存路径，添加"_unwarp"后缀
+        save_path = os.path.join(file_dir, f"{file_name}_state{file_ext}")
+
+        # 保存处理后的图像
+        # 确保中文路径能正常保存
+        cv2.imencode(file_ext, stateImage)[1].tofile(save_path)
+
+        print(f"处理后的图像已保存至: {save_path}")
+    except Exception as e:
+        print(f"处理图像 {image_path} 时出错: {str(e)}")
+
+
+def process_images_in_folder(folder_path):
+    """遍历文件夹中的图像文件并转换为HSV显示"""
+    # 支持的图像文件扩展名
+    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff']
+
+    if not os.path.exists(folder_path):
+        print(f"错误: 文件夹路径不存在 - {folder_path}")
+        return
+
+    if not os.path.isdir(folder_path):
+        print(f"错误: 指定的路径不是文件夹 - {folder_path}")
+        return
+
+    print(f"开始处理文件夹: {folder_path}")
+    image_count = 0
+
+    # 获取所有图像文件
+    for filename in os.listdir(folder_path):
+        file_ext = os.path.splitext(filename)[1].lower()
+        if file_ext in image_extensions:
+            image_path = os.path.join(folder_path, filename)
+            convert_to_hsv_and_display(image_path)
+            image_count += 1
+
+    print(f"处理完成，共显示了 {image_count} 张图像。")
+
+
+if __name__ == "__main__":
+    # 设置默认文件夹路径，请根据需要修改
+    DEFAULT_FOLDER_PATH = r"D:/标签拼接/劲酒封盖/PIC"
+    # 处理文件夹中的图像
+    process_images_in_folder(DEFAULT_FOLDER_PATH)
